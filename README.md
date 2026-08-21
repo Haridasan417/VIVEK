@@ -8,11 +8,14 @@ VIVEK is a unified **Scam Intelligence Engine** for India-focused scam patterns 
   - chat text
   - links
   - screenshot OCR text
+  - audio transcript (Phase 2 scaffold)
+  - video context text (Phase 2 scaffold)
 - Auto-detects modality and runs detectors in parallel.
 - Produces one explainable output:
   - `risk_score` (0–100)
   - `action`: `Safe` / `Caution` / `High-Risk` / `Block`
   - plain-language reason
+  - per-engine score and status (`ok` / `timeout`)
 - Stores every result to a local feedback DB (`vivek_feedback.db`) to support a learning loop.
 
 ## Why this is not a toy
@@ -22,12 +25,19 @@ Real scams in India are multi-step and narrative-driven (impersonation + urgency
 ## Architecture (implemented)
 
 - **Input layer**: `POST /analyze` accepts message text, URL, screenshot OCR text.
+- **Input normalization contract**: request payload is normalized into an internal `EvidenceBundle`:
+  - `text`
+  - `links[]` (auto-normalized with `https://` when scheme is missing)
+  - `image_ocr_text`
+  - `metadata`
 - **Modality engines**:
   - text scam-script heuristics
   - link/domain risk checks (typosquat-like impersonation, suspicious TLD, punycode, non-HTTPS, IP-host links)
   - screenshot text context checks (payment-alert mimicry + scam cues)
+  - audio and video engines (disabled by default; feature-gated for Phase 2 rollout)
 - **Fusion layer**:
   - weighted risk fusion + cross-modal correlation bonus
+  - timeout-safe scoring (timed-out engines are excluded from weighted score)
 - **Output layer**:
   - score + action + top reason + per-engine scores
 - **Feedback loop**:
@@ -54,12 +64,26 @@ Cut for Round 1:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
 ```
 
 API will be available at `http://127.0.0.1:8000`.
+
+To enable Phase 2 engines in this scaffold:
+
+```powershell
+$env:VIVEK_ENABLE_AUDIO_ENGINE="1"
+$env:VIVEK_ENABLE_VIDEO_ENGINE="1"
+python app.py
+```
+
+Check active Phase 2 runtime config:
+
+```powershell
+curl http://127.0.0.1:8000/phase2/status
+```
 
 Example:
 

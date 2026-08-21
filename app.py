@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -35,6 +36,14 @@ class AnalyzeRequest(BaseModel):
         default=None,
         description="OCR extracted text from screenshot (MVP assumes OCR done by client)",
     )
+    audio_transcript: str | None = Field(
+        default=None,
+        description="Speech-to-text output for audio/voice-note analysis",
+    )
+    video_context_text: str | None = Field(
+        default=None,
+        description="Video analysis context from frame/caption metadata",
+    )
     source: str = Field(default="whatsapp", description="Source channel")
 
 
@@ -45,6 +54,12 @@ class AnalyzeResponse(BaseModel):
     modalities: list[str]
     engine_scores: dict[str, int]
     engine_status: dict[str, str]
+
+
+class Phase2StatusResponse(BaseModel):
+    audio_engine_enabled: bool
+    video_engine_enabled: bool
+    engine_timeout_seconds: float
 
 
 @dataclass
@@ -101,6 +116,10 @@ def detect_modalities(payload: AnalyzeRequest) -> list[str]:
         modalities.append("link")
     if payload.screenshot_text:
         modalities.append("screenshot")
+    if payload.audio_transcript:
+        modalities.append("audio")
+    if payload.video_context_text:
+        modalities.append("video")
     return modalities
 
 
@@ -108,6 +127,8 @@ def to_evidence_bundle(payload: AnalyzeRequest) -> dict[str, Any]:
     text = (payload.message_text or "").strip()
     raw_url = (payload.url or "").strip()
     screenshot_text = (payload.screenshot_text or "").strip()
+    audio_transcript = (payload.audio_transcript or "").strip()
+    video_context_text = (payload.video_context_text or "").strip()
     normalized_url = raw_url if raw_url else None
     if normalized_url and "://" not in normalized_url:
         normalized_url = f"https://{normalized_url}"
@@ -118,6 +139,8 @@ def to_evidence_bundle(payload: AnalyzeRequest) -> dict[str, Any]:
         "text": text or None,
         "links": links,
         "image_ocr_text": screenshot_text or None,
+        "audio_transcript": audio_transcript or None,
+        "video_context_text": video_context_text or None,
         "metadata": {"ingest_channel": payload.source},
     }
 
@@ -208,6 +231,41 @@ async def analyze_screenshot(screenshot_text: str | None) -> EngineResult:
     return EngineResult(score=score, reasons=reasons)
 
 
+async def analyze_audio(audio_transcript: str | None) -> EngineResult:
+    if not audio_transcript:
+        return EngineResult(score=0, reasons=[])
+    score, reasons = _keyword_hits(audio_transcript)
+    if any(x in audio_transcript.lower() for x in ["ai voice", "voice clone", "synthetic voice"]):
+        score = min(100, score + 20)
+        reasons.append("Audio includes voice-clone/deepfake cues")
+    if re.search(r"\b(call|speak)\b.*\b(manager|officer|bank)\b", audio_transcript.lower()):
+        score = min(100, score + 12)
+        reasons.append("Audio script suggests authority impersonation")
+    return EngineResult(score=score, reasons=reasons)
+
+
+async def analyze_video(video_context_text: str | None) -> EngineResult:
+    if not video_context_text:
+        return EngineResult(score=0, reasons=[])
+    normalized = video_context_text.lower()
+    score = 0
+    reasons = []
+
+    if any(x in normalized for x in ["deepfake", "face swap", "lip sync mismatch"]):
+        score += 30
+        reasons.append("Video metadata indicates potential deepfake artifacts")
+
+    cue_score, cue_reasons = _keyword_hits(video_context_text)
+    score += int(cue_score * 0.6)
+    reasons.extend(cue_reasons[:2])
+
+    if any(x in normalized for x in ["breaking alert", "investment guaranteed", "urgent payment"]):
+        score += 15
+        reasons.append("Video messaging uses high-pressure scam framing")
+
+    return EngineResult(score=min(score, 100), reasons=reasons)
+
+
 def _action_from_score(score: int) -> str:
     if score >= 75:
         return BLOCK
@@ -219,6 +277,8 @@ def _action_from_score(score: int) -> str:
 
 
 ENGINE_TIMEOUT_SECONDS = 1.5
+ENABLE_AUDIO_ENGINE = os.getenv("VIVEK_ENABLE_AUDIO_ENGINE", "0") == "1"
+ENABLE_VIDEO_ENGINE = os.getenv("VIVEK_ENABLE_VIDEO_ENGINE", "0") == "1"
 
 
 async def _run_engine_with_timeout(engine_name: str, coro: Any) -> EngineResult:
@@ -232,10 +292,24 @@ async def _run_engine_with_timeout(engine_name: str, coro: Any) -> EngineResult:
         )
 
 
+async def _run_optional_engine(
+    engine_name: str, enabled: bool, input_value: str | None, analyzer: Any
+) -> EngineResult:
+    if not input_value:
+        return EngineResult(score=0, reasons=[])
+    if not enabled:
+        return EngineResult(
+            score=0,
+            reasons=[f"{engine_name} engine is disabled in this deployment"],
+            status="disabled",
+        )
+    return await _run_engine_with_timeout(engine_name, analyzer(input_value))
+
+
 def fuse_results(
     results: dict[str, EngineResult], modalities: list[str]
 ) -> tuple[int, list[str], dict[str, int], dict[str, str]]:
-    weights = {"text": 0.35, "link": 0.4, "screenshot": 0.25}
+    weights = {"text": 0.3, "link": 0.3, "screenshot": 0.2, "audio": 0.12, "video": 0.08}
     scorable_modalities = [m for m in modalities if results[m].status == "ok"]
     present_weight = sum(weights[m] for m in scorable_modalities) or 1
     weighted_score = sum(results[m].score * weights[m] for m in scorable_modalities) / present_weight
@@ -261,6 +335,22 @@ def fuse_results(
     ):
         correlation_bonus += 8
         reasons.append("Text aligns with suspicious payment screenshot")
+    if (
+        "audio" in scorable_modalities
+        and "text" in scorable_modalities
+        and results["audio"].score >= 40
+        and results["text"].score >= 40
+    ):
+        correlation_bonus += 6
+        reasons.append("Audio and text scripts show coordinated impersonation cues")
+    if (
+        "video" in scorable_modalities
+        and "audio" in scorable_modalities
+        and results["video"].score >= 45
+        and results["audio"].score >= 35
+    ):
+        correlation_bonus += 6
+        reasons.append("Audio-video pair suggests synthetic deepfake campaign")
 
     final_score = min(100, int(round(weighted_score + correlation_bonus)))
     engine_scores = {k: v.score for k, v in results.items() if k in modalities}
@@ -272,9 +362,22 @@ feedback_store = FeedbackStore()
 app = FastAPI(title="VIVEK Scam Intelligence Engine", version="0.1.0")
 
 
+def get_phase2_status() -> Phase2StatusResponse:
+    return Phase2StatusResponse(
+        audio_engine_enabled=ENABLE_AUDIO_ENGINE,
+        video_engine_enabled=ENABLE_VIDEO_ENGINE,
+        engine_timeout_seconds=ENGINE_TIMEOUT_SECONDS,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/phase2/status", response_model=Phase2StatusResponse)
+def phase2_status() -> Phase2StatusResponse:
+    return get_phase2_status()
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -287,6 +390,10 @@ async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         modalities.append("link")
     if bundle["image_ocr_text"]:
         modalities.append("screenshot")
+    if bundle["audio_transcript"]:
+        modalities.append("audio")
+    if bundle["video_context_text"]:
+        modalities.append("video")
     if not modalities:
         return AnalyzeResponse(
             risk_score=0,
@@ -297,13 +404,21 @@ async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             engine_status={},
         )
 
-    text_result, link_result, screenshot_result = await asyncio.gather(
+    text_result, link_result, screenshot_result, audio_result, video_result = await asyncio.gather(
         _run_engine_with_timeout("text", analyze_text(bundle["text"])),
         _run_engine_with_timeout("link", analyze_link(bundle["links"][0] if bundle["links"] else None)),
         _run_engine_with_timeout("screenshot", analyze_screenshot(bundle["image_ocr_text"])),
+        _run_optional_engine("audio", ENABLE_AUDIO_ENGINE, bundle["audio_transcript"], analyze_audio),
+        _run_optional_engine("video", ENABLE_VIDEO_ENGINE, bundle["video_context_text"], analyze_video),
     )
 
-    results = {"text": text_result, "link": link_result, "screenshot": screenshot_result}
+    results = {
+        "text": text_result,
+        "link": link_result,
+        "screenshot": screenshot_result,
+        "audio": audio_result,
+        "video": video_result,
+    }
     score, reasons, engine_scores, engine_status = fuse_results(results, modalities)
     action = _action_from_score(score)
     summary = reasons[0] if reasons else "No high-risk scam indicators detected"
