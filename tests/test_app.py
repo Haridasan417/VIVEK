@@ -2,7 +2,8 @@ import asyncio
 import unittest
 
 import app as app_module
-from app import AnalyzeRequest, analyze, detect_modalities, to_evidence_bundle
+from app import analyze, detect_modalities, to_evidence_bundle
+from schemas import AnalyzeRequest
 
 
 class VivekTests(unittest.TestCase):
@@ -41,8 +42,10 @@ class VivekTests(unittest.TestCase):
         self.assertEqual(bundle["metadata"]["ingest_channel"], "whatsapp")
 
     def test_engine_timeout_fallback(self):
+        import engines
+
         original_timeout = app_module.ENGINE_TIMEOUT_SECONDS
-        original_analyze_text = app_module.analyze_text
+        original_analyze_text = engines.analyze_text
 
         async def slow_text_engine(message_text):
             await asyncio.sleep(0.05)
@@ -57,6 +60,31 @@ class VivekTests(unittest.TestCase):
         finally:
             app_module.analyze_text = original_analyze_text
             app_module.ENGINE_TIMEOUT_SECONDS = original_timeout
+
+    def test_digital_arrest_pattern_match_boosts_score(self):
+        payload = AnalyzeRequest(
+            message_text=(
+                "This is CBI officer speaking, your Aadhaar is linked to illegal parcel, "
+                "you are under digital arrest, stay on video call"
+            ),
+        )
+        response = asyncio.run(analyze(payload))
+        self.assertIsNotNone(response.matched_pattern)
+        self.assertEqual(response.matched_pattern.pattern_id, "digital_arrest")
+        self.assertIn(response.action, {"High-Risk", "Block"})
+
+    def test_social_engine_triggers_on_account_signals(self):
+        payload = AnalyzeRequest(
+            message_text="Congratulations you are selected, pay a small deposit to unlock withdrawal",
+            account_age_days=3,
+            followers_count=5,
+            following_count=800,
+            claims_official=True,
+            is_verified=False,
+        )
+        response = asyncio.run(analyze(payload))
+        self.assertIn("social", response.modalities)
+        self.assertGreater(response.engine_scores["social"], 0)
 
 
 if __name__ == "__main__":
