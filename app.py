@@ -44,12 +44,14 @@ class AnalyzeResponse(BaseModel):
     reason: str
     modalities: list[str]
     engine_scores: dict[str, int]
+    engine_status: dict[str, str]
 
 
 @dataclass
 class EngineResult:
     score: int
     reasons: list[str]
+    status: str = "ok"
 
 
 class FeedbackStore:
@@ -100,6 +102,24 @@ def detect_modalities(payload: AnalyzeRequest) -> list[str]:
     if payload.screenshot_text:
         modalities.append("screenshot")
     return modalities
+
+
+def to_evidence_bundle(payload: AnalyzeRequest) -> dict[str, Any]:
+    text = (payload.message_text or "").strip()
+    raw_url = (payload.url or "").strip()
+    screenshot_text = (payload.screenshot_text or "").strip()
+    normalized_url = raw_url if raw_url else None
+    if normalized_url and "://" not in normalized_url:
+        normalized_url = f"https://{normalized_url}"
+
+    links = [normalized_url] if normalized_url else []
+    return {
+        "source": payload.source,
+        "text": text or None,
+        "links": links,
+        "image_ocr_text": screenshot_text or None,
+        "metadata": {"ingest_channel": payload.source},
+    }
 
 
 def _keyword_hits(text: str) -> tuple[int, list[str]]:
@@ -198,26 +218,54 @@ def _action_from_score(score: int) -> str:
     return SAFE
 
 
-def fuse_results(results: dict[str, EngineResult], modalities: list[str]) -> tuple[int, list[str], dict[str, int]]:
+ENGINE_TIMEOUT_SECONDS = 1.5
+
+
+async def _run_engine_with_timeout(engine_name: str, coro: Any) -> EngineResult:
+    try:
+        return await asyncio.wait_for(coro, timeout=ENGINE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        return EngineResult(
+            score=0,
+            reasons=[f"{engine_name} timed out and was excluded from scoring"],
+            status="timeout",
+        )
+
+
+def fuse_results(
+    results: dict[str, EngineResult], modalities: list[str]
+) -> tuple[int, list[str], dict[str, int], dict[str, str]]:
     weights = {"text": 0.35, "link": 0.4, "screenshot": 0.25}
-    present_weight = sum(weights[m] for m in modalities) or 1
-    weighted_score = sum(results[m].score * weights[m] for m in modalities) / present_weight
+    scorable_modalities = [m for m in modalities if results[m].status == "ok"]
+    present_weight = sum(weights[m] for m in scorable_modalities) or 1
+    weighted_score = sum(results[m].score * weights[m] for m in scorable_modalities) / present_weight
 
     reasons: list[str] = []
     for m in modalities:
         reasons.extend(results[m].reasons[:2])
 
     correlation_bonus = 0
-    if results["text"].score >= 45 and results["link"].score >= 45:
+    if (
+        "text" in scorable_modalities
+        and "link" in scorable_modalities
+        and results["text"].score >= 45
+        and results["link"].score >= 45
+    ):
         correlation_bonus += 10
         reasons.append("Text and link jointly indicate coordinated phishing")
-    if results["text"].score >= 40 and results["screenshot"].score >= 40:
+    if (
+        "text" in scorable_modalities
+        and "screenshot" in scorable_modalities
+        and results["text"].score >= 40
+        and results["screenshot"].score >= 40
+    ):
         correlation_bonus += 8
         reasons.append("Text aligns with suspicious payment screenshot")
 
     final_score = min(100, int(round(weighted_score + correlation_bonus)))
     engine_scores = {k: v.score for k, v in results.items() if k in modalities}
-    return final_score, reasons, engine_scores
+    engine_status = {k: v.status for k, v in results.items() if k in modalities}
+    return final_score, reasons, engine_scores, engine_status
 
 
 feedback_store = FeedbackStore()
@@ -231,7 +279,14 @@ def health() -> dict[str, str]:
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
-    modalities = detect_modalities(payload)
+    bundle = to_evidence_bundle(payload)
+    modalities = []
+    if bundle["text"]:
+        modalities.append("text")
+    if bundle["links"]:
+        modalities.append("link")
+    if bundle["image_ocr_text"]:
+        modalities.append("screenshot")
     if not modalities:
         return AnalyzeResponse(
             risk_score=0,
@@ -239,16 +294,17 @@ async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             reason="No analyzable artifact found. Share text, link, or screenshot.",
             modalities=[],
             engine_scores={},
+            engine_status={},
         )
 
     text_result, link_result, screenshot_result = await asyncio.gather(
-        analyze_text(payload.message_text),
-        analyze_link(payload.url),
-        analyze_screenshot(payload.screenshot_text),
+        _run_engine_with_timeout("text", analyze_text(bundle["text"])),
+        _run_engine_with_timeout("link", analyze_link(bundle["links"][0] if bundle["links"] else None)),
+        _run_engine_with_timeout("screenshot", analyze_screenshot(bundle["image_ocr_text"])),
     )
 
     results = {"text": text_result, "link": link_result, "screenshot": screenshot_result}
-    score, reasons, engine_scores = fuse_results(results, modalities)
+    score, reasons, engine_scores, engine_status = fuse_results(results, modalities)
     action = _action_from_score(score)
     summary = reasons[0] if reasons else "No high-risk scam indicators detected"
 
@@ -260,6 +316,7 @@ async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         reason=summary,
         modalities=modalities,
         engine_scores=engine_scores,
+        engine_status=engine_status,
     )
 
 
