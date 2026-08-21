@@ -79,6 +79,12 @@ $env:VIVEK_ENABLE_VIDEO_ENGINE="1"
 python app.py
 ```
 
+Check active Phase 2 runtime config:
+
+```powershell
+curl http://127.0.0.1:8000/phase2/status
+```
+
 Example:
 
 ```bash

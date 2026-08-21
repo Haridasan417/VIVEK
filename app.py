@@ -56,6 +56,12 @@ class AnalyzeResponse(BaseModel):
     engine_status: dict[str, str]
 
 
+class Phase2StatusResponse(BaseModel):
+    audio_engine_enabled: bool
+    video_engine_enabled: bool
+    engine_timeout_seconds: float
+
+
 @dataclass
 class EngineResult:
     score: int
@@ -356,9 +362,22 @@ feedback_store = FeedbackStore()
 app = FastAPI(title="VIVEK Scam Intelligence Engine", version="0.1.0")
 
 
+def get_phase2_status() -> Phase2StatusResponse:
+    return Phase2StatusResponse(
+        audio_engine_enabled=ENABLE_AUDIO_ENGINE,
+        video_engine_enabled=ENABLE_VIDEO_ENGINE,
+        engine_timeout_seconds=ENGINE_TIMEOUT_SECONDS,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/phase2/status", response_model=Phase2StatusResponse)
+def phase2_status() -> Phase2StatusResponse:
+    return get_phase2_status()
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
