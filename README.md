@@ -8,6 +8,8 @@ VIVEK is a unified **Scam Intelligence Engine** for India-focused scam patterns 
   - chat text
   - links
   - screenshot OCR text
+  - audio transcript (Phase 2 scaffold)
+  - video context text (Phase 2 scaffold)
 - Auto-detects modality and runs detectors in parallel.
 - Produces one explainable output:
   - `risk_score` (0–100)
@@ -32,6 +34,7 @@ Real scams in India are multi-step and narrative-driven (impersonation + urgency
   - text scam-script heuristics
   - link/domain risk checks (typosquat-like impersonation, suspicious TLD, punycode, non-HTTPS, IP-host links)
   - screenshot text context checks (payment-alert mimicry + scam cues)
+  - audio and video engines (disabled by default; feature-gated for Phase 2 rollout)
 - **Fusion layer**:
   - weighted risk fusion + cross-modal correlation bonus
   - timeout-safe scoring (timed-out engines are excluded from weighted score)
@@ -67,6 +70,14 @@ python app.py
 ```
 
 API will be available at `http://127.0.0.1:8000`.
+
+To enable Phase 2 engines in this scaffold:
+
+```powershell
+$env:VIVEK_ENABLE_AUDIO_ENGINE="1"
+$env:VIVEK_ENABLE_VIDEO_ENGINE="1"
+python app.py
+```
 
 Example:
 
